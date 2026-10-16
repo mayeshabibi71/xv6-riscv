@@ -46,3 +46,46 @@ You will need a RISC-V "newlib" tool chain from
 https://github.com/riscv/riscv-gnu-toolchain, and qemu compiled for
 riscv64-softmmu.  Once they are installed, and in your shell
 search path, you can run "make qemu".
+
+## ADDENDUM: ADVANCED KERNEL FEATURES AND THEIR IMPLEMENTATION 
+
+### 1. Priority-Based Task Scheduler
+*   **Feature Description:** Replaces the native round-robin scheduler with a preemptive priority scheme where the CPU selects the runnable process with the highest assigned numeric priority value.
+*   **File Context:** `kernel/proc.h`, `kernel/proc.c`
+*   **Implementation Guide:**
+    1. In `struct proc` (`kernel/proc.h`), add an integer field: `int priority;`. Initialize this value to a default (e.g., `10`) inside `allocproc()`.
+    2. Create a new system call, `sys_setpriority(int new_priority)`, to allow user space utilities to change a process's scheduling weights.
+    3. Modify the core execution loop in `scheduler()` (`kernel/proc.c`). Instead of picking the next consecutive runnable process via a linear loop, iterate through the entire process table `proc[NPROC]` to find the process where `p->state == RUNNABLE` and `p->priority` is highest.
+
+### 2. Copy-on-Write (COW) Fork Optimization
+*   **Feature Description:** Optimizes the `fork()` system call by deferring physical memory allocation. Instead of duplicating page tables and data pages immediately, both processes share the same physical pages marked as read-only.
+*   **File Context:** `kernel/vm.c`, `kernel/trap.c`, `kernel/kalloc.c`
+*   **Implementation Guide:**
+    1. Modify `uvmcopy()` (`kernel/vm.c`) to map the parent's physical pages into the child's page table. Clear the write flag (`PTE_W`) and set a custom software architecture flag (such as bit 8 or 9 of the RISC-V PTE layout, designated as `PTE_COW`).
+    2. Create an atomic reference-counting array in `kernel/kalloc.c` mapped to physical memory pages to keep track of how many processes share a given page. Increment the count on a copy-on-write `fork()`.
+    3. In `usertrap()` (`kernel/trap.c`), intercept store faults (`scause == 15`). If the faulting virtual address has the `PTE_COW` flag active, allocate a single new physical page via `kalloc()`, copy the data, update the page table permissions to restore `PTE_W`, and decrement the old page's reference counter.
+
+### 3. Shared Memory Inter-Process Communication (IPC)
+*   **Feature Description:** Permits independent processes to map a single region of physical memory pages into their respective virtual address spaces, enabling zero-copy data transfer.
+*   **File Context:** `kernel/sysproc.c`, `kernel/vm.c`
+*   **Implementation Guide:**
+    1. Define a global kernel array or tracking table of shared memory regions containing physical page allocations and a unique identifying key.
+    2. Implement two new architecture system calls: `void* shm_attach(int key)` and `int shm_detach(void* addr)`.
+    3. When `shm_attach` is triggered, look up or allocate a physical page, then invoke `mappages()` inside `kernel/vm.c` to bind that physical page address to an unused virtual address segment above the user process's current heap boundary.
+
+### 4. Lightweight Threading Engine (`clone()` System Call)
+*   **Feature Description:** Introduces lightweight execution contexts that run concurrently within the exact same parent memory boundaries, differing from standard isolated processes.
+*   **File Context:** `kernel/sysproc.c`, `kernel/proc.c`
+*   **Implementation Guide:**
+    1. Implement a `sys_clone()` system call patterned closely after the native `fork()` call inside `kernel/proc.c`.
+    2. Unlike `fork()`, do not call `uvmcopy()`. Instead, explicitly copy the parent's root page table pointer (`p->pagetable`) to the new child process structure so they share a single unified memory map.
+    3. Ensure the child's trap frame (`p->trapframe->sp`) points to a unique, separate stack segment allocated within the shared user address space to prevent register manipulation overlaps.
+
+### 5. Automated Lazy Virtual Memory Allocator
+*   **Feature Description:** Defers allocation of heap space requested via `sbrk()` until the application attempts to read or write to that specific memory block.
+*   **File Context:** `kernel/sysproc.c`, `kernel/trap.c`
+*   **Implementation Guide:**
+    1. Intercept the `sys_sbrk()` system call. Instead of instantly executing `growproc()` to allocate page chunks, simply increment the process memory size marker (`p->sz`) and return the old size immediately.
+    2. When the user application attempts to access this unmapped space, the RISC-V hardware will trigger a page fault trap (`scause == 13` or `15`).
+    3. Inside `usertrap()`, verify if the faulting address (`r_stval()`) resides within the valid range between the old memory limit and the new `p->sz`. If valid, invoke `kalloc()` to clear a page, zero-initialize it, and apply `mappages()` to service the application transparently before resuming instruction execution.
+
